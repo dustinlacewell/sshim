@@ -1,0 +1,120 @@
+import os
+
+from twisted.conch import unix, avatar
+from twisted.conch import checkers as conch_checkers
+from twisted.conch.interfaces import IConchUser
+from twisted.conch.openssh_compat import factory
+from twisted.conch.ssh.userauth import SSHUserAuthServer
+from twisted.conch.ssh import keys, session
+from twisted.cred import portal, checkers, credentials
+from twisted.internet import reactor, defer, endpoints
+from zope.interface import implementer, implements
+from twisted.cred.credentials import ISSHPrivateKey
+
+USER = os.environ.get('USER', 'root')
+PORT = os.environ.get('PORT', '2200')
+
+publicKey = 'ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAGEArzJx8OYOnJmzf4tfBEvLi8DVPrJ3/c9k2I/Az64fxjHf9imyRJbixtQhlH9lfNjUIx+4LmrJH5QNRsFporcHDKOTwTTYLh5KmRpslkYHRivcJSkbh/C+BR3utDS555mV'
+
+privateKey = """-----BEGIN RSA PRIVATE KEY-----
+MIIByAIBAAJhAK8ycfDmDpyZs3+LXwRLy4vA1T6yd/3PZNiPwM+uH8Yx3/YpskSW
+4sbUIZR/ZXzY1CMfuC5qyR+UDUbBaaK3Bwyjk8E02C4eSpkabJZGB0Yr3CUpG4fw
+vgUd7rQ0ueeZlQIBIwJgbh+1VZfr7WftK5lu7MHtqE1S1vPWZQYE3+VUn8yJADyb
+Z4fsZaCrzW9lkIqXkE3GIY+ojdhZhkO1gbG0118sIgphwSWKRxK0mvh6ERxKqIt1
+xJEJO74EykXZV4oNJ8sjAjEA3J9r2ZghVhGN6V8DnQrTk24Td0E8hU8AcP0FVP+8
+PQm/g/aXf2QQkQT+omdHVEJrAjEAy0pL0EBH6EVS98evDCBtQw22OZT52qXlAwZ2
+gyTriKFVoqjeEjt3SZKKqXHSApP/AjBLpF99zcJJZRq2abgYlf9lv1chkrWqDHUu
+DZttmYJeEfiFBBavVYIF1dOlZT0G8jMCMBc7sOSZodFnAiryP+Qg9otSBjJ3bQML
+pSTqy7c3a2AScC/YyOwkDaICHnnD3XyjMwIxALRzl0tQEKMXs6hH8ToUdlLROCrP
+EhQ0wahUTCk1gKA4uPD6TMTChavbh4K63OvbKg==
+-----END RSA PRIVATE KEY-----"""
+
+
+class TTYCastAvatar(unix.UnixConchUser, unix.SSHSessionForUnixConchUser):
+    def __init__(self, username):
+        unix.UnixConchUser.__init__(self, USER) # proxy to system user
+        unix.SSHSessionForUnixConchUser.__init__(self, self)
+        self.username = username # login username
+        self.channelLookup.update({'session':session.SSHSession})
+
+
+class StickyAuthorizedKeysFiles(conch_checkers.UNIXAuthorizedKeysFiles):
+
+    # copypasta because its private for some reason
+    def _keysFromFilepaths(self, filepaths, parseKey):
+        for fp in filepaths:
+            if fp.exists():
+                try:
+                    with fp.open() as f:
+                        for key in conch_checkers.readAuthorizedKeyFile(f, parseKey):
+                            yield key
+                except (IOError, OSError) as e:
+                    conch_checkers.log.msg("Unable to read {0}: {1!s}".format(fp.path, e))
+
+    def _root(self, username):
+        '''get FilePath ssh home directory'''
+        try:
+            passwd = self._userdb.getpwnam(username)
+        except KeyError as E:
+            return conch_checkers.FilePath('/tmp')
+
+        return conch_checkers.FilePath(passwd.pw_dir).child('.ssh')
+
+    def getAuthorizedKeys(self, username):
+        '''get the public key for username'''
+        root = self._root(USER) # home of system user
+        filename = username + ".pub"
+        filepath = root.child(filename)
+        return [self._parseKey(filepath)]
+
+    def addAuthorizedKey(self, username, pubkey):
+        '''set the public key for a username'''
+        print "Adding key for", username
+        passwd = self._userdb.getpwnam(USER)
+        root = self._root(USER) # home of system user
+        filename = username + ".pub"
+        filepath = root.child(filename)
+        with open(filepath.path, "wb") as fobj:
+            fobj.write(pubkey.blob())
+
+
+
+@implementer(checkers.ICredentialsChecker)
+class StickyPubkeyAuth(conch_checkers.SSHPublicKeyChecker):
+
+    def __init__(self):
+        keydb = StickyAuthorizedKeysFiles()
+        conch_checkers.SSHPublicKeyChecker.__init__(self, keydb)
+
+    def _addKey(self, pubKey, credentials):
+        self._keydb.addAuthorizedKey(credentials.username, pubKey)
+
+    def _checkKey(self, pubKey, credentials):
+        keys = self._keydb.getAuthorizedKeys(credentials.username)
+        if len(keys):
+            if any(key == pubKey for key in keys):
+                return pubKey
+            raise conch_checkers.UnauthorizedLogin("Key not authorized")
+        self._addKey(pubKey, credentials)
+        return pubKey
+
+
+class StickyRealm:
+    implements(portal.IRealm)
+    def requestAvatar(self, avatarId, mind, *interfaces):
+        return IConchUser, TTYCastAvatar(avatarId), lambda: None
+
+def makeFactory():
+    r = StickyRealm()
+    f = factory.OpenSSHFactory()
+    f.portal = portal.Portal(r, [StickyPubkeyAuth()])
+    f.publicKeys = {'ssh-rsa': keys.Key.fromString(data=publicKey)}
+    f.privateKeys = {'ssh-rsa': keys.Key.fromString(data=privateKey)}
+    f.services['ssh-userauth'] = SSHUserAuthServer
+    f.startFactory()
+    return f
+
+f = makeFactory()
+ep = endpoints.serverFromString(reactor, "tcp:" + PORT)
+ep.listen(f)
+reactor.run()
